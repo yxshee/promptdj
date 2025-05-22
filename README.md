@@ -26,12 +26,12 @@
 
 ## 🖥️ Preview
 
-<div align="center">
+<p align="center">
 
 <img src="assets/screenshot.png" width="69%" alt="PromptDJ Screenshot" />
-<sub>*A sneak peek at the PromptDJ interface*</sub>
 
-</div>
+
+</p>
 
 
 ---
