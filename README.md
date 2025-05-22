@@ -26,8 +26,10 @@
 
 ## 🖥️ Preview
 
-![PromptDJ Screenshot](assets/screenshot.png)  
+<img src="assets/screenshot.png" width="69%" alt="PromptDJ Screenshot" />
 <sub>*A sneak peek at the PromptDJ interface*</sub>
+
+
 
 ---
 
