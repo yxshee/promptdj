@@ -1,8 +1,7 @@
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
-*/
-
+ */
 import {Blob} from '@google/genai';
 
 function encode(bytes) {

@@ -3,10 +3,10 @@ html, body {
   margin: 0;
 }
 body {
-  overflow:hidden;
+  overflow: hidden;
 }
 body.dragging {
-  cursor: ns-resize;
+  cursor: grabbing;
 }
 body.dragging * {
   user-select: none;

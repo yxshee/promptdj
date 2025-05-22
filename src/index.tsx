@@ -1,413 +1,229 @@
 /**
- * @fileoverview Control real time music with a MIDI controller
+ * @fileoverview Control real time music with text prompts
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { css, html, LitElement, svg, CSSResultGroup } from 'lit';
-import { customElement, property, query, state } from 'lit/decorators';
-import { styleMap } from 'lit/directives/style-map';
-import { classMap } from 'lit/directives/class-map';
+import {css, CSSResultGroup, html, LitElement, svg} from 'lit';
+import {customElement, property, query, state} from 'lit/decorators.js';
+import {classMap} from 'lit/directives/class-map.js';
+import {styleMap} from 'lit/directives/style-map.js';
 
-import { GoogleGenAI, type LiveMusicSession, type LiveMusicServerMessage } from '@google/genai';
-import { decode, decodeAudioData } from '../data/utils'
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY, apiVersion: 'v1alpha' });
-const model = 'lyria-realtime-exp';
-
+import {
+  GoogleGenAI,
+  type LiveMusicGenerationConfig,
+  type LiveMusicServerMessage,
+  type LiveMusicSession,
+} from '@google/genai';
+import {decode, decodeAudioData} from './utils';
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+  apiVersion: 'v1alpha',
+});
+let model = 'lyria-realtime-exp';
 
 interface Prompt {
   readonly promptId: string;
+  readonly color: string;
   text: string;
   weight: number;
-  cc: number;
-  color: string;
-}
-
-interface ControlChange {
-  channel: number;
-  cc: number;
-  value: number;
 }
 
 type PlaybackState = 'stopped' | 'playing' | 'loading' | 'paused';
 
-/**
- * Throttles a callback to be called at most once per `delay` milliseconds.
- * Also returns the result of the last "fresh" call...
- */
-function throttle<T extends (...args: Parameters<T>) => ReturnType<T>>(
-  func: T,
-  delay: number,
-): (...args: Parameters<T>) => ReturnType<T> {
-  let lastCall = -Infinity;
-  let lastResult: ReturnType<T>;
-  return (...args: Parameters<T>) => {
+/** Throttles a callback to be called at most once per `freq` milliseconds. */
+function throttle(func: (...args: unknown[]) => void, delay: number) {
+  let lastCall = 0;
+  return (...args: unknown[]) => {
     const now = Date.now();
     const timeSinceLastCall = now - lastCall;
     if (timeSinceLastCall >= delay) {
-      lastResult = func(...args);
+      func(...args);
       lastCall = now;
     }
-    return lastResult;
   };
 }
 
-const DEFAULT_PROMPTS = [
-  { color: '#9900ff', text: 'Bossa Nova' },
-  { color: '#5200ff', text: 'Chillwave' },
-  { color: '#ff25f6', text: 'Drum and Bass' },
-  { color: '#2af6de', text: 'Post Punk' },
-  { color: '#ffdd28', text: 'Shoegaze' },
-  { color: '#2af6de', text: 'Funk' },
-  { color: '#9900ff', text: 'Chiptune' },
-  { color: '#3dffab', text: 'Lush Strings' },
-  { color: '#d8ff3e', text: 'Sparkling Arpeggios' },
-  { color: '#d9b2ff', text: 'Staccato Rhythms' },
-  { color: '#3dffab', text: 'Punchy Kick' },
-  { color: '#ffdd28', text: 'Dubstep' },
-  { color: '#ff25f6', text: 'K Pop' },
-  { color: '#d8ff3e', text: 'Neo Soul' },
-  { color: '#5200ff', text: 'Trip Hop' },
-  { color: '#d9b2ff', text: 'Thrash' },
+const PROMPT_TEXT_PRESETS = [
+  'Bossa Nova',
+  'Minimal Techno',
+  'Drum and Bass',
+  'Post Punk',
+  'Shoegaze',
+  'Funk',
+  'Chiptune',
+  'Lush Strings',
+  'Sparkling Arpeggios',
+  'Staccato Rhythms',
+  'Punchy Kick',
+  'Dubstep',
+  'K Pop',
+  'Neo Soul',
+  'Trip Hop',
+  'Thrash',
 ];
 
-// Toast Message component
-// -----------------------------------------------------------------------------
+const COLORS = [
+  '#9900ff',
+  '#5200ff',
+  '#ff25f6',
+  '#2af6de',
+  '#ffdd28',
+  '#3dffab',
+  '#d8ff3e',
+  '#d9b2ff',
+];
 
-@customElement('toast-message')
-class ToastMessage extends LitElement {
-  static override styles = css`
-    .toast {
-      line-height: 1.6;
-      position: fixed;
-      top: 20px;
-      left: 50%;
-      transform: translateX(-50%);
-      background-color: #000;
-      color: white;
-      padding: 15px;
-      border-radius: 5px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 15px;
-      min-width: 200px;
-      max-width: 80vw;
-      transition: transform 0.5s cubic-bezier(0.19, 1, 0.22, 1);
-    }
-    button {
-      border-radius: 100px;
-      aspect-ratio: 1;
-      border: none;
-      color: #000;
-      cursor: pointer;
-    }
-    .toast:not(.showing) {
-      transition-duration: 1s;
-      transform: translate(-50%, -200%);
-    }
-  `;
-
-  @property({ type: String }) message = '';
-  @property({ type: Boolean }) showing = false;
-
-  override render() {
-    return html`<div class=${classMap({ showing: this.showing, toast: true })}>
-      <div class="message">${this.message}</div>
-      <button @click=${this.hide}>✕</button>
-    </div>`;
+function getUnusedRandomColor(usedColors: string[]): string {
+  const availableColors = COLORS.filter((c) => !usedColors.includes(c));
+  if (availableColors.length === 0) {
+    // If no available colors, pick a random one from the original list.
+    return COLORS[Math.floor(Math.random() * COLORS.length)];
   }
-
-  show(message: string) {
-    this.showing = true;
-    this.message = message;
-  }
-
-  hide() {
-    this.showing = false;
-  }
-
+  return availableColors[Math.floor(Math.random() * availableColors.length)];
 }
 
-
-// WeightKnob component
+// WeightSlider component
 // -----------------------------------------------------------------------------
-
-/** Maps prompt weight to halo size. */
-const MIN_HALO_SCALE = 1;
-const MAX_HALO_SCALE = 2;
-
-/** The amount of scale to add to the halo based on audio level. */
-const HALO_LEVEL_MODIFIER = 1;
-
-/** A knob for adjusting and visualizing prompt weight. */
-@customElement('weight-knob')
-class WeightKnob extends LitElement {
+/** A slider for adjusting and visualizing prompt weight. */
+@customElement('weight-slider')
+class WeightSlider extends LitElement {
   static override styles = css`
     :host {
-      cursor: grab;
+      cursor: ns-resize;
       position: relative;
-      width: 100%;
-      aspect-ratio: 1;
-      flex-shrink: 0;
-      touch-action: none;
+      height: 100%;
+      display: flex;
+      justify-content: center;
+      flex-direction: column;
+      align-items: center;
+      padding: 5px;
     }
-    svg {
+    .scroll-container {
+      width: 100%;
+      flex-grow: 1;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+    }
+    .value-display {
+      font-size: 1.3vmin;
+      color: #ccc;
+      margin: 0.5vmin 0;
+      user-select: none;
+      text-align: center;
+    }
+    .slider-container {
+      position: relative;
+      width: 10px;
+      height: 100%;
+      background-color: #0009;
+      border-radius: 4px;
+    }
+    #thumb {
       position: absolute;
-      top: 0;
+      bottom: 0;
       left: 0;
       width: 100%;
-      height: 100%;
-    }
-    #halo {
-      position: absolute;
-      z-index: -1;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      border-radius: 50%;
-      mix-blend-mode: lighten;
-      transform: scale(2);
-      will-change: transform;
+      border-radius: 4px;
+      box-shadow: 0 0 3px rgba(0, 0, 0, 0.7);
     }
   `;
 
-  @property({ type: Number }) value = 0;
-  @property({ type: String }) color = '#000';
-  @property({ type: Number }) audioLevel = 0;
+  @property({type: Number}) value = 0; // Range 0-2
+  @property({type: String}) color = '#000';
+
+  @query('.scroll-container') private scrollContainer!: HTMLDivElement;
 
   private dragStartPos = 0;
   private dragStartValue = 0;
+  private containerBounds: DOMRect | null = null;
 
   constructor() {
     super();
     this.handlePointerDown = this.handlePointerDown.bind(this);
     this.handlePointerMove = this.handlePointerMove.bind(this);
+    this.handleTouchMove = this.handleTouchMove.bind(this);
     this.handlePointerUp = this.handlePointerUp.bind(this);
   }
 
   private handlePointerDown(e: PointerEvent) {
+    e.preventDefault();
+    this.containerBounds = this.scrollContainer.getBoundingClientRect();
     this.dragStartPos = e.clientY;
     this.dragStartValue = this.value;
     document.body.classList.add('dragging');
     window.addEventListener('pointermove', this.handlePointerMove);
-    window.addEventListener('pointerup', this.handlePointerUp);
+    window.addEventListener('touchmove', this.handleTouchMove, {
+      passive: false,
+    });
+    window.addEventListener('pointerup', this.handlePointerUp, {once: true});
+    this.updateValueFromPosition(e.clientY);
   }
 
   private handlePointerMove(e: PointerEvent) {
-    const delta = this.dragStartPos - e.clientY;
-    this.value = this.dragStartValue + delta * 0.01;
-    this.value = Math.max(0, Math.min(2, this.value));
-    this.dispatchEvent(new CustomEvent<number>('input', { detail: this.value }));
+    this.updateValueFromPosition(e.clientY);
+  }
+
+  private handleTouchMove(e: TouchEvent) {
+    e.preventDefault();
+    this.updateValueFromPosition(e.touches[0].clientY);
   }
 
   private handlePointerUp(e: PointerEvent) {
     window.removeEventListener('pointermove', this.handlePointerMove);
-    window.removeEventListener('pointerup', this.handlePointerUp);
     document.body.classList.remove('dragging');
+    this.containerBounds = null;
   }
 
   private handleWheel(e: WheelEvent) {
+    e.preventDefault();
     const delta = e.deltaY;
-    this.value = this.value + delta * -0.0025;
+    this.value = this.value + delta * -0.005;
     this.value = Math.max(0, Math.min(2, this.value));
-    this.dispatchEvent(new CustomEvent<number>('input', { detail: this.value }));
+    this.dispatchInputEvent();
   }
 
-  private describeArc(
-    centerX: number,
-    centerY: number,
-    startAngle: number,
-    endAngle: number,
-    radius: number,
-  ): string {
-    const startX = centerX + radius * Math.cos(startAngle);
-    const startY = centerY + radius * Math.sin(startAngle);
-    const endX = centerX + radius * Math.cos(endAngle);
-    const endY = centerY + radius * Math.sin(endAngle);
+  private updateValueFromPosition(clientY: number) {
+    if (!this.containerBounds) return;
 
-    const largeArcFlag = endAngle - startAngle <= Math.PI ? '0' : '1';
+    const trackHeight = this.containerBounds.height;
+    // Calculate position relative to the top of the track
+    const relativeY = clientY - this.containerBounds.top;
+    // Invert and normalize (0 at bottom, 1 at top)
+    const normalizedValue =
+      1 - Math.max(0, Math.min(trackHeight, relativeY)) / trackHeight;
+    // Scale to 0-2 range
+    this.value = normalizedValue * 2;
 
-    return (
-      `M ${startX} ${startY}` +
-      `A ${radius} ${radius} 0 ${largeArcFlag} 1 ${endX} ${endY}`
-    );
+    this.dispatchInputEvent();
+  }
+
+  private dispatchInputEvent() {
+    this.dispatchEvent(new CustomEvent<number>('input', {detail: this.value}));
   }
 
   override render() {
-    const rotationRange = Math.PI * 2 * 0.75;
-    const minRot = -rotationRange / 2 - Math.PI / 2;
-    const maxRot = rotationRange / 2 - Math.PI / 2;
-    const rot = minRot + (this.value / 2) * (maxRot - minRot);
-    const dotStyle = styleMap({
-      transform: `translate(40px, 40px) rotate(${rot}rad)`,
+    const thumbHeightPercent = (this.value / 2) * 100;
+    const thumbStyle = styleMap({
+      height: `${thumbHeightPercent}%`,
+      backgroundColor: this.color,
+      // Hide thumb if value is 0 or very close to prevent visual glitch
+      display: this.value > 0.01 ? 'block' : 'none',
     });
-
-    let scale = (this.value / 2) * (MAX_HALO_SCALE - MIN_HALO_SCALE);
-    scale += MIN_HALO_SCALE;
-    scale += this.audioLevel * HALO_LEVEL_MODIFIER;
-
-    const haloStyle = styleMap({
-      display: this.value > 0 ? 'block' : 'none',
-      background: this.color,
-      transform: `scale(${scale})`,
-    });
+    const displayValue = this.value.toFixed(2);
 
     return html`
-      <div id="halo" style=${haloStyle}></div>
-      <!-- Static SVG elements -->
-      <svg viewBox="0 0 80 80">
-        <ellipse
-          opacity="0.4"
-          cx="40"
-          cy="40"
-          rx="40"
-          ry="40"
-          fill="url(#f1)" />
-        <g filter="url(#f2)">
-          <ellipse cx="40" cy="40" rx="29" ry="29" fill="url(#f3)" />
-        </g>
-        <g filter="url(#f4)">
-          <circle cx="40" cy="40" r="20.6667" fill="url(#f5)" />
-        </g>
-        <circle cx="40" cy="40" r="18" fill="url(#f6)" />
-        <defs>
-          <filter
-            id="f2"
-            x="8.33301"
-            y="10.0488"
-            width="63.333"
-            height="64"
-            filterUnits="userSpaceOnUse"
-            color-interpolation-filters="sRGB">
-            <feFlood flood-opacity="0" result="BackgroundImageFix" />
-            <feColorMatrix
-              in="SourceAlpha"
-              type="matrix"
-              values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0"
-              result="hardAlpha" />
-            <feOffset dy="2" />
-            <feGaussianBlur stdDeviation="1.5" />
-            <feComposite in2="hardAlpha" operator="out" />
-            <feColorMatrix
-              type="matrix"
-              values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0" />
-            <feBlend mode="normal" in2="BackgroundImageFix" result="shadow1" />
-            <feBlend
-              mode="normal"
-              in="SourceGraphic"
-              in2="shadow1"
-              result="shape" />
-          </filter>
-          <filter
-            id="f4"
-            x="11.333"
-            y="19.0488"
-            width="57.333"
-            height="59.334"
-            filterUnits="userSpaceOnUse"
-            color-interpolation-filters="sRGB">
-            <feFlood flood-opacity="0" result="BackgroundImageFix" />
-            <feColorMatrix
-              in="SourceAlpha"
-              type="matrix"
-              values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0"
-              result="hardAlpha" />
-            <feOffset dy="10" />
-            <feGaussianBlur stdDeviation="4" />
-            <feComposite in2="hardAlpha" operator="out" />
-            <feColorMatrix
-              type="matrix"
-              values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0" />
-            <feBlend mode="normal" in2="BackgroundImageFix" result="shadow1" />
-            <feColorMatrix
-              in="SourceAlpha"
-              type="matrix"
-              values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0"
-              result="hardAlpha" />
-            <feMorphology
-              radius="5"
-              operator="erode"
-              in="SourceAlpha"
-              result="shadow2" />
-            <feOffset dy="8" />
-            <feGaussianBlur stdDeviation="3" />
-            <feComposite in2="hardAlpha" operator="out" />
-            <feColorMatrix
-              type="matrix"
-              values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0" />
-            <feBlend mode="normal" in2="shadow1" result="shadow2" />
-            <feBlend
-              mode="normal"
-              in="SourceGraphic"
-              in2="shadow2"
-              result="shape" />
-          </filter>
-          <linearGradient
-            id="f1"
-            x1="40"
-            y1="0"
-            x2="40"
-            y2="80"
-            gradientUnits="userSpaceOnUse">
-            <stop stop-opacity="0.5" />
-            <stop offset="1" stop-color="white" stop-opacity="0.3" />
-          </linearGradient>
-          <radialGradient
-            id="f3"
-            cx="0"
-            cy="0"
-            r="1"
-            gradientUnits="userSpaceOnUse"
-            gradientTransform="translate(40 40) rotate(90) scale(29 29)">
-            <stop offset="0.6" stop-color="white" />
-            <stop offset="1" stop-color="white" stop-opacity="0.7" />
-          </radialGradient>
-          <linearGradient
-            id="f5"
-            x1="40"
-            y1="19.0488"
-            x2="40"
-            y2="60.3822"
-            gradientUnits="userSpaceOnUse">
-            <stop stop-color="white" />
-            <stop offset="1" stop-color="#F2F2F2" />
-          </linearGradient>
-          <linearGradient
-            id="f6"
-            x1="40"
-            y1="21.7148"
-            x2="40"
-            y2="57.7148"
-            gradientUnits="userSpaceOnUse">
-            <stop stop-color="#EBEBEB" />
-            <stop offset="1" stop-color="white" />
-          </linearGradient>
-        </defs>
-      </svg>
-      <!-- SVG elements that move, separated to limit redraws -->
-      <svg
-        viewBox="0 0 80 80"
+      <div
+        class="scroll-container"
         @pointerdown=${this.handlePointerDown}
         @wheel=${this.handleWheel}>
-        <g style=${dotStyle}>
-          <circle cx="14" cy="0" r="2" fill="#000" />
-        </g>
-        <path
-          d=${this.describeArc(40, 40, minRot, maxRot, 34.5)}
-          fill="none"
-          stroke="#0003"
-          stroke-width="3"
-          stroke-linecap="round" />
-        <path
-          d=${this.describeArc(40, 40, minRot, rot, 34.5)}
-          fill="none"
-          stroke="#fff"
-          stroke-width="3"
-          stroke-linecap="round" />
-      </svg>
+        <div class="slider-container">
+          <div id="thumb" style=${thumbStyle}></div>
+        </div>
+        <div class="value-display">${displayValue}</div>
+      </div>
     `;
   }
 }
@@ -558,7 +374,7 @@ class IconButton extends LitElement {
 /** A button for toggling play/pause. */
 @customElement('play-pause-button')
 export class PlayPauseButton extends IconButton {
-  @property({ type: String }) playbackState: PlaybackState = 'stopped';
+  @property({type: String}) playbackState: PlaybackState = 'stopped';
 
   static override styles = [
     IconButton.styles,
@@ -572,11 +388,15 @@ export class PlayPauseButton extends IconButton {
         transform-box: fill-box;
       }
       @keyframes spin {
-        from { transform: rotate(0deg); }
-        to { transform: rotate(359deg); }
+        from {
+          transform: rotate(0deg);
+        }
+        to {
+          transform: rotate(359deg);
+        }
       }
-    `
-  ]
+    `,
+  ];
 
   private renderPause() {
     return svg`<path
@@ -605,210 +425,202 @@ export class PlayPauseButton extends IconButton {
   }
 }
 
-/** Simple class for dispatching MIDI CC messages as events. */
-class MidiDispatcher extends EventTarget {
-  private access: MIDIAccess | null = null;
-  activeMidiInputId: string | null = null;
-
-  async getMidiAccess(): Promise<string[]> {
-    if (this.access) {
-      return Array.from(this.access.inputs.keys());
-    }
-
-    this.access = await navigator
-      .requestMIDIAccess({ sysex: false })
-      .catch((error) => error);
-    if (!(this.access instanceof MIDIAccess)) {
-      console.warn('MIDI access not supported.', this.access);
-      return [];
-    }
-
-    const inputIds = Array.from(this.access.inputs.keys());
-
-    if (inputIds.length > 0 && this.activeMidiInputId === null) {
-      this.activeMidiInputId = inputIds[0];
-    }
-
-    for (const input of this.access.inputs.values()) {
-      input.onmidimessage = (event: MIDIMessageEvent) => {
-        if (input.id !== this.activeMidiInputId) return;
-
-        const { data } = event;
-        if (!data) {
-          console.error('MIDI message has no data');
-          return;
-        }
-
-        const statusByte = data[0];
-        const channel = statusByte & 0x0f;
-        const messageType = statusByte & 0xf0;
-
-        const isControlChange = messageType === 0xb0;
-        if (!isControlChange) return;
-
-        const detail: ControlChange = { cc: data[1], value: data[2], channel };
-        this.dispatchEvent(
-          new CustomEvent<ControlChange>('cc-message', { detail }),
-        );
-      };
-    }
-
-    return inputIds;
+@customElement('reset-button')
+export class ResetButton extends IconButton {
+  private renderResetIcon() {
+    return svg`<path fill="#fefefe" d="M71,77.1c-2.9,0-5.7-0.6-8.3-1.7s-4.8-2.6-6.7-4.5c-1.9-1.9-3.4-4.1-4.5-6.7c-1.1-2.6-1.7-5.3-1.7-8.3h4.7
+      c0,4.6,1.6,8.5,4.8,11.7s7.1,4.8,11.7,4.8c4.6,0,8.5-1.6,11.7-4.8c3.2-3.2,4.8-7.1,4.8-11.7s-1.6-8.5-4.8-11.7
+      c-3.2-3.2-7.1-4.8-11.7-4.8h-0.4l3.7,3.7L71,46.4L61.5,37l9.4-9.4l3.3,3.4l-3.7,3.7H71c2.9,0,5.7,0.6,8.3,1.7
+      c2.6,1.1,4.8,2.6,6.7,4.5c1.9,1.9,3.4,4.1,4.5,6.7c1.1,2.6,1.7,5.3,1.7,8.3c0,2.9-0.6,5.7-1.7,8.3c-1.1,2.6-2.6,4.8-4.5,6.7
+      s-4.1,3.4-6.7,4.5C76.7,76.5,73.9,77.1,71,77.1z"/>`;
   }
 
-  getDeviceName(id: string): string | null {
-    if (!this.access) {
-      return null;
-    }
-    const input = this.access.inputs.get(id);
-    return input ? input.name : null;
+  override renderIcon() {
+    return this.renderResetIcon();
   }
 }
 
-/** Simple class for getting the current level from our audio element. */
-class AudioAnalyser {
-  readonly node: AnalyserNode;
-  private readonly freqData: Uint8Array;
-  constructor(context: AudioContext) {
-    this.node = context.createAnalyser();
-    this.node.smoothingTimeConstant = 0;
-    this.freqData = new Uint8Array(this.node.frequencyBinCount);
+// AddPromptButton component
+// -----------------------------------------------------------------------------
+/** A button for adding a new prompt. */
+@customElement('add-prompt-button')
+export class AddPromptButton extends IconButton {
+  private renderAddIcon() {
+    return svg`<path d="M67 40 H73 V52 H85 V58 H73 V70 H67 V58 H55 V52 H67 Z" fill="#FEFEFE" />`;
   }
-  getCurrentLevel() {
-    this.node.getByteFrequencyData(this.freqData);
-    const avg = this.freqData.reduce((a, b) => a + b, 0) / this.freqData.length;
-    return avg / 0xff;
+
+  override renderIcon() {
+    return this.renderAddIcon();
   }
 }
 
-/** A single prompt input associated with a MIDI CC. */
+// Toast Message component
+// -----------------------------------------------------------------------------
+
+@customElement('toast-message')
+class ToastMessage extends LitElement {
+  static override styles = css`
+    .toast {
+      line-height: 1.6;
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background-color: #000;
+      color: white;
+      padding: 15px;
+      border-radius: 5px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 15px;
+      min-width: 200px;
+      max-width: 80vw;
+      transition: transform 0.5s cubic-bezier(0.19, 1, 0.22, 1);
+      z-index: 11;
+    }
+    button {
+      border-radius: 100px;
+      aspect-ratio: 1;
+      border: none;
+      color: #000;
+      cursor: pointer;
+    }
+    .toast:not(.showing) {
+      transition-duration: 1s;
+      transform: translate(-50%, -200%);
+    }
+  `;
+
+  @property({type: String}) message = '';
+  @property({type: Boolean}) showing = false;
+
+  override render() {
+    return html`<div class=${classMap({showing: this.showing, toast: true})}>
+      <div class="message">${this.message}</div>
+      <button @click=${this.hide}>✕</button>
+    </div>`;
+  }
+
+  show(message: string) {
+    this.showing = true;
+    this.message = message;
+  }
+
+  hide() {
+    this.showing = false;
+  }
+}
+
+/** A single prompt input */
 @customElement('prompt-controller')
 class PromptController extends LitElement {
   static override styles = css`
     .prompt {
+      position: relative;
+      height: 100%;
       width: 100%;
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: center;
+      box-sizing: border-box;
+      overflow: hidden;
+      background-color: #2a2a2a;
+      border-radius: 5px;
     }
-    weight-knob {
-      width: 70%;
-      flex-shrink: 0;
-    }
-    #midi {
-      font-family: monospace;
-      text-align: center;
-      font-size: 1.5vmin;
-      border: 0.2vmin solid #fff;
-      border-radius: 0.5vmin;
-      padding: 2px 5px;
+    .remove-button {
+      position: absolute;
+      top: 1.2vmin;
+      left: 1.2vmin;
+      background: #666;
       color: #fff;
-      background: #0006;
+      border: none;
+      border-radius: 50%;
+      width: 2.8vmin;
+      height: 2.8vmin;
+      font-size: 1.8vmin;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 2.8vmin;
       cursor: pointer;
-      visibility: hidden;
-      user-select: none;
-      margin-top: 0.75vmin;
-      .learn-mode & {
-        color: orange;
-        border-color: orange;
-      }
-      .show-cc & {
-        visibility: visible;
-      }
+      opacity: 0.5;
+      transition: opacity 0.2s;
+      z-index: 10;
+    }
+    .remove-button:hover {
+      opacity: 1;
+    }
+    weight-slider {
+      /* Calculate height: 100% of parent minus controls height and margin */
+      max-height: calc(100% - 9vmin);
+      flex: 1;
+      min-height: 10vmin;
+      width: 100%;
+      box-sizing: border-box;
+      overflow: hidden;
+      margin: 2vmin 0 1vmin;
+    }
+    .controls {
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      align-items: center;
+      gap: 0.2vmin;
+      width: 100%;
+      height: 8vmin;
+      padding: 0 0.5vmin;
+      box-sizing: border-box;
+      margin-bottom: 1vmin;
     }
     #text {
       font-family: 'Google Sans', sans-serif;
-      font-weight: 500;
       font-size: 1.8vmin;
-      max-width: 100%;
-      min-width: 2vmin;
-      padding: 0.1em 0.3em;
-      margin-top: 0.5vmin;
-      flex-shrink: 0;
-      border-radius: 0.25vmin;
+      width: 100%;
+      flex-grow: 1;
+      max-height: 100%;
+      padding: 0.4vmin;
+      box-sizing: border-box;
       text-align: center;
-      white-space: wrap;
-      word-break: break-word;
-      overflow: hidden;
+      word-wrap: break-word;
+      overflow-y: auto;
       border: none;
       outline: none;
       -webkit-font-smoothing: antialiased;
-      background: #000;
       color: #fff;
-      &:not(:focus) {
-        text-overflow: ellipsis;
-      }
+      scrollbar-width: thin;
+      scrollbar-color: #666 #1a1a1a;
     }
-    :host([filtered=true]) #text {
+    #text::-webkit-scrollbar {
+      width: 6px;
+    }
+    #text::-webkit-scrollbar-track {
+      background: #0009;
+      border-radius: 3px;
+    }
+    #text::-webkit-scrollbar-thumb {
+      background-color: #666;
+      border-radius: 3px;
+    }
+    :host([filtered='true']) #text {
       background: #da2000;
-    }
-    @media only screen and (max-width: 600px) {
-      #text { 
-        font-size: 2.3vmin;
-      }
-      weight-knob {
-        width: 60%;
-      }
     }
   `;
 
-  @property({ type: String }) promptId = '';
-  @property({ type: String }) text = '';
-  @property({ type: Number }) weight = 0;
-  @property({ type: String }) color = '';
+  @property({type: String, reflect: true}) promptId = '';
+  @property({type: String}) text = '';
+  @property({type: Number}) weight = 0;
+  @property({type: String}) color = '';
 
-  @property({ type: Number }) cc = 0;
-  @property({ type: Number }) channel = 0; // Not currently used
+  @query('weight-slider') private weightInput!: WeightSlider;
+  @query('#text') private textInput!: HTMLSpanElement;
 
-  @property({ type: Boolean }) learnMode = false;
-  @property({ type: Boolean }) showCC = false;
-
-  @query('weight-knob') private weightInput!: WeightKnob;
-  @query('#text') private textInput!: HTMLInputElement;
-
-  @property({ type: Object })
-  midiDispatcher: MidiDispatcher | null = null;
-
-  @property({ type: Number }) audioLevel = 0;
-
-  private lastValidText!: string;
-
-  override connectedCallback() {
-    super.connectedCallback();
-    this.midiDispatcher?.addEventListener('cc-message', (e: Event) => {
-      const customEvent = e as CustomEvent<ControlChange>;
-      const { channel, cc, value } = customEvent.detail;
-      if (this.learnMode) {
-        this.cc = cc;
-        this.channel = channel;
-        this.learnMode = false;
-        this.dispatchPromptChange();
-      } else if (cc === this.cc) {
-        this.weight = (value / 127) * 2;
-        this.dispatchPromptChange();
-      }
-    });
-  }
-
-  override firstUpdated() {
-    // contenteditable is applied to textInput so we can "shrink-wrap" to text width
-    // It's set here and not render() because Lit doesn't believe it's a valid attribute.
-    this.textInput.setAttribute('contenteditable', 'plaintext-only');
-
-    // contenteditable will do weird things if this is part of the template.
-    this.textInput.textContent = this.text;
-    this.lastValidText = this.text;
-  }
-
-  update(changedProperties: Map<string, unknown>) {
-    if (changedProperties.has('showCC') && !this.showCC) {
-      this.learnMode = false;
+  private handleTextKeyDown(e: KeyboardEvent) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      this.updateText();
+      (e.target as HTMLElement).blur();
     }
-    if (changedProperties.has('text') && this.textInput) {
-      this.textInput.textContent = this.text;
-    }
-    super.update(changedProperties);
   }
 
   private dispatchPromptChange() {
@@ -818,33 +630,21 @@ class PromptController extends LitElement {
           promptId: this.promptId,
           text: this.text,
           weight: this.weight,
-          cc: this.cc,
           color: this.color,
         },
       }),
     );
   }
 
-  private async updateText() {
+  private updateText() {
+    console.log('updateText');
     const newText = this.textInput.textContent?.trim();
-    if (!newText) {
-      this.text = this.lastValidText;
-      this.textInput.textContent = this.lastValidText;
-    } else {
-      this.text = newText;
-      this.lastValidText = newText;
+    if (newText === '') {
+      this.textInput.textContent = this.text;
+      return;
     }
+    this.text = newText;
     this.dispatchPromptChange();
-  }
-
-  private onFocus() {
-    // .select() for contenteditable doesn't work.
-    const selection = window.getSelection();
-    if (!selection) return;
-    const range = document.createRange();
-    range.selectNodeContents(this.textInput);
-    selection.removeAllRanges();
-    selection.addRange(range);
   }
 
   private updateWeight() {
@@ -852,150 +652,706 @@ class PromptController extends LitElement {
     this.dispatchPromptChange();
   }
 
-  private toggleLearnMode() {
-    this.learnMode = !this.learnMode;
+  private dispatchPromptRemoved() {
+    this.dispatchEvent(
+      new CustomEvent<string>('prompt-removed', {
+        detail: this.promptId,
+        bubbles: true,
+        composed: true,
+      }),
+    );
   }
 
   override render() {
     const classes = classMap({
       'prompt': true,
-      'learn-mode': this.learnMode,
-      'show-cc': this.showCC,
     });
     return html`<div class=${classes}>
-      <weight-knob
+      <button class="remove-button" @click=${this.dispatchPromptRemoved}
+        >×</button
+      >
+      <weight-slider
         id="weight"
         value=${this.weight}
         color=${this.color}
-        audioLevel=${this.audioLevel}
-        @input=${this.updateWeight}></weight-knob>
-      <span
-        id="text"
-        spellcheck="false"
-        @focus=${this.onFocus}
-        @blur=${this.updateText}></span>
-      <div id="midi" @click=${this.toggleLearnMode}>
-        ${this.learnMode ? 'Learn' : `CC:${this.cc}`}
+        @input=${this.updateWeight}></weight-slider>
+      <div class="controls">
+        <span
+          id="text"
+          spellcheck="false"
+          contenteditable="plaintext-only"
+          @keydown=${this.handleTextKeyDown}
+          @blur=${this.updateText}
+          >${this.text}</span
+        >
       </div>
     </div>`;
   }
 }
 
-/** The grid of prompt inputs. */
-@customElement('prompt-dj-midi')
-class PromptDjMidi extends LitElement {
+/** A panel for managing real-time music generation settings. */
+@customElement('settings-controller')
+class SettingsController extends LitElement {
+  static override styles = css`
+    :host {
+      display: block;
+      padding: 2vmin;
+      background-color: #2a2a2a;
+      color: #eee;
+      box-sizing: border-box;
+      border-radius: 5px;
+      font-family: 'Google Sans', sans-serif;
+      font-size: 1.5vmin;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: #666 #1a1a1a;
+      transition: width 0.3s ease-out max-height 0.3s ease-out;
+    }
+    :host([showadvanced]) {
+      max-height: 40vmin;
+    }
+    :host::-webkit-scrollbar {
+      width: 6px;
+    }
+    :host::-webkit-scrollbar-track {
+      background: #1a1a1a;
+      border-radius: 3px;
+    }
+    :host::-webkit-scrollbar-thumb {
+      background-color: #666;
+      border-radius: 3px;
+    }
+    .setting {
+      margin-bottom: 0.5vmin;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5vmin;
+    }
+    label {
+      font-weight: bold;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      white-space: nowrap;
+      user-select: none;
+    }
+    label span:last-child {
+      font-weight: normal;
+      color: #ccc;
+      min-width: 3em;
+      text-align: right;
+    }
+    input[type='range'] {
+      --track-height: 8px;
+      --track-bg: #0009;
+      --track-border-radius: 4px;
+      --thumb-size: 16px;
+      --thumb-bg: #5200ff;
+      --thumb-border-radius: 50%;
+      --thumb-box-shadow: 0 0 3px rgba(0, 0, 0, 0.7);
+      --value-percent: 0%;
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: var(--track-height);
+      background: transparent;
+      cursor: pointer;
+      margin: 0.5vmin 0;
+      border: none;
+      padding: 0;
+      vertical-align: middle;
+    }
+    input[type='range']::-webkit-slider-runnable-track {
+      width: 100%;
+      height: var(--track-height);
+      cursor: pointer;
+      border: none;
+      background: linear-gradient(
+        to right,
+        var(--thumb-bg) var(--value-percent),
+        var(--track-bg) var(--value-percent)
+      );
+      border-radius: var(--track-border-radius);
+    }
+    input[type='range']::-moz-range-track {
+      width: 100%;
+      height: var(--track-height);
+      cursor: pointer;
+      background: var(--track-bg);
+      border-radius: var(--track-border-radius);
+      border: none;
+    }
+    input[type='range']::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      height: var(--thumb-size);
+      width: var(--thumb-size);
+      background: var(--thumb-bg);
+      border-radius: var(--thumb-border-radius);
+      box-shadow: var(--thumb-box-shadow);
+      cursor: pointer;
+      margin-top: calc((var(--thumb-size) - var(--track-height)) / -2);
+    }
+    input[type='range']::-moz-range-thumb {
+      height: var(--thumb-size);
+      width: var(--thumb-size);
+      background: var(--thumb-bg);
+      border-radius: var(--thumb-border-radius);
+      box-shadow: var(--thumb-box-shadow);
+      cursor: pointer;
+      border: none;
+    }
+    input[type='number'],
+    input[type='text'],
+    select {
+      background-color: #2a2a2a;
+      color: #eee;
+      border: 1px solid #666;
+      border-radius: 3px;
+      padding: 0.4vmin;
+      font-size: 1.5vmin;
+      font-family: inherit;
+      box-sizing: border-box;
+    }
+    input[type='number'] {
+      width: 6em;
+    }
+    input[type='text'] {
+      width: 100%;
+    }
+    input[type='text']::placeholder {
+      color: #888;
+    }
+    input[type='number']:focus,
+    input[type='text']:focus {
+      outline: none;
+      border-color: #5200ff;
+      box-shadow: 0 0 0 2px rgba(82, 0, 255, 0.3);
+    }
+    select {
+      width: 100%;
+    }
+    select:focus {
+      outline: none;
+      border-color: #5200ff;
+    }
+    select option {
+      background-color: #2a2a2a;
+      color: #eee;
+    }
+    .checkbox-setting {
+      flex-direction: row;
+      align-items: center;
+      gap: 1vmin;
+    }
+    input[type='checkbox'] {
+      cursor: pointer;
+      accent-color: #5200ff;
+    }
+    .core-settings-row {
+      display: flex;
+      flex-direction: row;
+      flex-wrap: wrap;
+      gap: 4vmin;
+      margin-bottom: 1vmin;
+      justify-content: space-evenly;
+    }
+    .core-settings-row .setting {
+      min-width: 16vmin;
+    }
+    .core-settings-row label span:last-child {
+      min-width: 2.5em;
+    }
+    .advanced-toggle {
+      cursor: pointer;
+      margin: 2vmin 0 1vmin 0;
+      color: #aaa;
+      text-decoration: underline;
+      user-select: none;
+      font-size: 1.4vmin;
+      width: fit-content;
+    }
+    .advanced-toggle:hover {
+      color: #eee;
+    }
+    .advanced-settings {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(10vmin, 1fr));
+      gap: 3vmin;
+      overflow: hidden;
+      max-height: 0;
+      opacity: 0;
+      transition:
+        max-height 0.3s ease-out,
+        opacity 0.3s ease-out;
+    }
+    .advanced-settings.visible {
+      max-width: 120vmin;
+      max-height: 40vmin;
+      opacity: 1;
+    }
+    hr.divider {
+      display: none;
+      border: none;
+      border-top: 1px solid #666;
+      margin: 2vmin 0;
+      width: 100%;
+    }
+    :host([showadvanced]) hr.divider {
+      display: block;
+    }
+    .auto-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5vmin;
+    }
+    .setting[auto='true'] input[type='range'] {
+      pointer-events: none;
+      filter: grayscale(100%);
+    }
+    .auto-row span {
+      margin-left: auto;
+    }
+    .auto-row label {
+      cursor: pointer;
+    }
+    .auto-row input[type='checkbox'] {
+      cursor: pointer;
+      margin: 0;
+    }
+  `;
+
+  private readonly defaultConfig = {
+    temperature: 1.1,
+    topK: 40,
+    guidance: 4.0,
+  };
+
+  @state() private config: LiveMusicGenerationConfig = this.defaultConfig;
+
+  @state() showAdvanced = false;
+
+  @state() autoDensity = true;
+
+  @state() lastDefinedDensity: number;
+
+  @state() autoBrightness = true;
+
+  @state() lastDefinedBrightness: number;
+
+  public resetToDefaults() {
+    this.config = this.defaultConfig;
+    this.autoDensity = true;
+    this.lastDefinedDensity = undefined;
+    this.autoBrightness = true;
+    this.lastDefinedBrightness = undefined;
+    this.dispatchSettingsChange();
+  }
+
+  private updateSliderBackground(inputEl: HTMLInputElement) {
+    if (inputEl.type !== 'range') {
+      return;
+    }
+    const min = Number(inputEl.min) || 0;
+    const max = Number(inputEl.max) || 100;
+    const value = Number(inputEl.value);
+    const percentage = ((value - min) / (max - min)) * 100;
+    inputEl.style.setProperty('--value-percent', `${percentage}%`);
+  }
+
+  private handleInputChange(e: Event) {
+    const target = e.target as HTMLInputElement;
+    const key = target.id as
+      | keyof LiveMusicGenerationConfig
+      | 'auto-density'
+      | 'auto-brightness';
+    let value: string | number | boolean | undefined = target.value;
+
+    if (target.type === 'number' || target.type === 'range') {
+      value = target.value === '' ? undefined : Number(target.value);
+      // Update slider background if it's a range input before handling the value change.
+      if (target.type === 'range') {
+        this.updateSliderBackground(target);
+      }
+    } else if (target.type === 'checkbox') {
+      value = target.checked;
+    } else if (target.type === 'select-one') {
+      const selectElement = target as HTMLSelectElement;
+      if (selectElement.options[selectElement.selectedIndex]?.disabled) {
+        value = undefined;
+      } else {
+        value = target.value;
+      }
+    }
+
+    const newConfig = {
+      ...this.config,
+      [key]: value,
+    };
+
+    if (newConfig.density !== undefined) {
+      this.lastDefinedDensity = newConfig.density;
+      console.log(this.lastDefinedDensity);
+    }
+
+    if (newConfig.brightness !== undefined) {
+      this.lastDefinedBrightness = newConfig.brightness;
+    }
+
+    if (key === 'auto-density') {
+      this.autoDensity = Boolean(value);
+      newConfig.density = this.autoDensity
+        ? undefined
+        : this.lastDefinedDensity;
+    } else if (key === 'auto-brightness') {
+      this.autoBrightness = Boolean(value);
+      newConfig.brightness = this.autoBrightness
+        ? undefined
+        : this.lastDefinedBrightness;
+    }
+
+    this.config = newConfig;
+    this.dispatchSettingsChange();
+  }
+
+  override updated(changedProperties: Map<string | symbol, unknown>) {
+    super.updated(changedProperties);
+    if (changedProperties.has('config')) {
+      this.shadowRoot
+        ?.querySelectorAll<HTMLInputElement>('input[type="range"]')
+        .forEach((slider: HTMLInputElement) => {
+          const configValue =
+            this.config[slider.id as keyof LiveMusicGenerationConfig];
+          if (typeof configValue === 'number') {
+            slider.value = String(configValue);
+          } else if (slider.id === 'density' || slider.id === 'brightness') {
+            // Handle potentially undefined density/brightness with default for background
+            slider.value = String(configValue ?? 0.5);
+          }
+          this.updateSliderBackground(slider);
+        });
+    }
+  }
+
+  private dispatchSettingsChange() {
+    this.dispatchEvent(
+      new CustomEvent<LiveMusicGenerationConfig>('settings-changed', {
+        detail: this.config,
+        bubbles: true,
+        composed: true,
+      }),
+    );
+  }
+
+  private toggleAdvancedSettings() {
+    this.showAdvanced = !this.showAdvanced;
+  }
+
+  override render() {
+    const cfg = this.config;
+    const advancedClasses = classMap({
+      'advanced-settings': true,
+      'visible': this.showAdvanced,
+    });
+    const scaleMap = new Map<string, string>([
+      ['Auto', 'SCALE_UNSPECIFIED'],
+      ['C Major / A Minor', 'C_MAJOR_A_MINOR'],
+      ['C# Major / A# Minor', 'D_FLAT_MAJOR_B_FLAT_MINOR'],
+      ['D Major / B Minor', 'D_MAJOR_B_MINOR'],
+      ['D# Major / C Minor', 'E_FLAT_MAJOR_C_MINOR'],
+      ['E Major / C# Minor', 'E_MAJOR_D_FLAT_MINOR'],
+      ['F Major / D Minor', 'F_MAJOR_D_MINOR'],
+      ['F# Major / D# Minor', 'G_FLAT_MAJOR_E_FLAT_MINOR'],
+      ['G Major / E Minor', 'G_MAJOR_E_MINOR'],
+      ['G# Major / F Minor', 'A_FLAT_MAJOR_F_MINOR'],
+      ['A Major / F# Minor', 'A_MAJOR_G_FLAT_MINOR'],
+      ['A# Major / G Minor', 'B_FLAT_MAJOR_G_MINOR'],
+      ['B Major / G# Minor', 'B_MAJOR_A_FLAT_MINOR'],
+    ]);
+
+    return html`
+      <div class="core-settings-row">
+        <div class="setting">
+          <label for="temperature"
+            >Temperature<span>${cfg.temperature!.toFixed(1)}</span></label
+          >
+          <input
+            type="range"
+            id="temperature"
+            min="0"
+            max="3"
+            step="0.1"
+            .value=${cfg.temperature!.toString()}
+            @input=${this.handleInputChange} />
+        </div>
+        <div class="setting">
+          <label for="guidance"
+            >Guidance<span>${cfg.guidance!.toFixed(1)}</span></label
+          >
+          <input
+            type="range"
+            id="guidance"
+            min="0"
+            max="6"
+            step="0.1"
+            .value=${cfg.guidance!.toString()}
+            @input=${this.handleInputChange} />
+        </div>
+        <div class="setting">
+          <label for="topK">Top K<span>${cfg.topK}</span></label>
+          <input
+            type="range"
+            id="topK"
+            min="1"
+            max="100"
+            step="1"
+            .value=${cfg.topK!.toString()}
+            @input=${this.handleInputChange} />
+        </div>
+      </div>
+      <hr class="divider" />
+      <div class=${advancedClasses}>
+        <div class="setting">
+          <label for="seed">Seed</label>
+          <input
+            type="number"
+            id="seed"
+            .value=${cfg.seed ?? ''}
+            @input=${this.handleInputChange}
+            placeholder="Auto" />
+        </div>
+        <div class="setting">
+          <label for="bpm">BPM</label>
+          <input
+            type="number"
+            id="bpm"
+            min="60"
+            max="180"
+            .value=${cfg.bpm ?? ''}
+            @input=${this.handleInputChange}
+            placeholder="Auto" />
+        </div>
+        <div class="setting" auto=${this.autoDensity}>
+          <label for="density">Density</label>
+          <input
+            type="range"
+            id="density"
+            min="0"
+            max="1"
+            step="0.05"
+            .value=${this.lastDefinedDensity}
+            @input=${this.handleInputChange} />
+          <div class="auto-row">
+            <input
+              type="checkbox"
+              id="auto-density"
+              .checked=${this.autoDensity}
+              @input=${this.handleInputChange} />
+            <label for="auto-density">Auto</label>
+            <span>${(this.lastDefinedDensity ?? 0.5).toFixed(2)}</span>
+          </div>
+        </div>
+        <div class="setting" auto=${this.autoBrightness}>
+          <label for="brightness">Brightness</label>
+          <input
+            type="range"
+            id="brightness"
+            min="0"
+            max="1"
+            step="0.05"
+            .value=${this.lastDefinedBrightness}
+            @input=${this.handleInputChange} />
+          <div class="auto-row">
+            <input
+              type="checkbox"
+              id="auto-brightness"
+              .checked=${this.autoBrightness}
+              @input=${this.handleInputChange} />
+            <label for="auto-brightness">Auto</label>
+            <span>${(this.lastDefinedBrightness ?? 0.5).toFixed(2)}</span>
+          </div>
+        </div>
+        <div class="setting">
+          <label for="scale">Scale</label>
+          <select
+            id="scale"
+            .value=${cfg.scale || 'SCALE_UNSPECIFIED'}
+            @change=${this.handleInputChange}>
+            <option value="" disabled selected>Select Scale</option>
+            ${[...scaleMap.entries()].map(
+              ([displayName, enumValue]) =>
+                html`<option value=${enumValue}>${displayName}</option>`,
+            )}
+          </select>
+        </div>
+        <div class="setting">
+          <div class="setting checkbox-setting">
+            <input
+              type="checkbox"
+              id="muteBass"
+              .checked=${!!cfg.muteBass}
+              @change=${this.handleInputChange} />
+            <label for="muteBass" style="font-weight: normal;">Mute Bass</label>
+          </div>
+          <div class="setting checkbox-setting">
+            <input
+              type="checkbox"
+              id="muteDrums"
+              .checked=${!!cfg.muteDrums}
+              @change=${this.handleInputChange} />
+            <label for="muteDrums" style="font-weight: normal;"
+              >Mute Drums</label
+            >
+          </div>
+          <div class="setting checkbox-setting">
+            <input
+              type="checkbox"
+              id="onlyBassAndDrums"
+              .checked=${!!cfg.onlyBassAndDrums}
+              @change=${this.handleInputChange} />
+            <label for="onlyBassAndDrums" style="font-weight: normal;"
+              >Only Bass & Drums</label
+            >
+          </div>
+        </div>
+      </div>
+      <div class="advanced-toggle" @click=${this.toggleAdvancedSettings}>
+        ${this.showAdvanced ? 'Hide' : 'Show'} Advanced Settings
+      </div>
+    `;
+  }
+}
+
+/** Component for the PromptDJ UI. */
+@customElement('prompt-dj')
+class PromptDj extends LitElement {
   static override styles = css`
     :host {
       height: 100%;
+      width: 100%;
       display: flex;
       flex-direction: column;
       justify-content: center;
       align-items: center;
       box-sizing: border-box;
+      padding: 2vmin;
       position: relative;
+      font-size: 1.8vmin;
     }
     #background {
-      will-change: background-image;
       position: absolute;
       height: 100%;
       width: 100%;
       z-index: -1;
       background: #111;
     }
-    #grid {
-      width: 80vmin;
-      height: 80vmin;
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 2.5vmin;
-      margin-top: 8vmin;
-    }
-    prompt-controller { 
-      width: 100%;
-    }
-    play-pause-button {
-      position: relative;
-      width: 15vmin;
-    }
-    #buttons {
-      position: absolute;
-      top: 0;
-      left: 0;
-      padding: 5px;
+    .prompts-area {
       display: flex;
-      gap: 5px;
+      align-items: flex-end;
+      justify-content: center;
+      flex: 4;
+      width: 100%;
+      margin-top: 2vmin;
+      gap: 2vmin;
     }
-    button {
-      font: inherit;
-      font-weight: 600;
-      cursor: pointer;
-      color: #fff;
-      background: #0002;
-      -webkit-font-smoothing: antialiased;
-      border: 1.5px solid #fff;
-      border-radius: 4px;
-      user-select: none;
-      padding: 3px 6px;
-      &.active {
-        background-color: #fff;
-        color: #000;
-      }
+    #prompts-container {
+      display: flex;
+      flex-direction: row;
+      align-items: flex-end;
+      flex-shrink: 1;
+      height: 100%;
+      gap: 2vmin;
+      margin-left: 10vmin;
+      padding: 1vmin;
+      overflow-x: auto;
+      scrollbar-width: thin;
+      scrollbar-color: #666 #1a1a1a;
     }
-    select {
-      font: inherit;
-      padding: 5px;
-      background: #fff;
-      color: #000;
+    #prompts-container::-webkit-scrollbar {
+      height: 8px;
+    }
+    #prompts-container::-webkit-scrollbar-track {
+      background: #111;
       border-radius: 4px;
-      border: none;
-      outline: none;
-      cursor: pointer;
+    }
+    #prompts-container::-webkit-scrollbar-thumb {
+      background-color: #666;
+      border-radius: 4px;
+    }
+    #prompts-container::-webkit-scrollbar-thumb:hover {
+      background-color: #777;
+    }
+    /* Add pseudo-elements for centering while keeping elements visible when scrolling */
+    #prompts-container::before,
+    #prompts-container::after {
+      content: '';
+      flex: 1;
+      min-width: 0.5vmin;
+    }
+    .add-prompt-button-container {
+      display: flex;
+      align-items: flex-end;
+      height: 100%;
+      flex-shrink: 0;
+    }
+    #settings-container {
+      flex: 1;
+      margin: 2vmin 0 1vmin 0;
+    }
+    .playback-container {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    play-pause-button,
+    add-prompt-button,
+    reset-button {
+      width: 12vmin;
+      flex-shrink: 0;
+    }
+    prompt-controller {
+      height: 100%;
+      max-height: 80vmin;
+      min-width: 14vmin;
+      max-width: 16vmin;
+      flex: 1;
     }
   `;
 
+  @property({
+    type: Object,
+    attribute: false,
+  })
   private prompts: Map<string, Prompt>;
-  private midiDispatcher: MidiDispatcher;
-  private audioAnalyser: AudioAnalyser;
-
-  @state() private playbackState: PlaybackState = 'stopped';
-
+  private nextPromptId: number; // Monotonically increasing ID for new prompts
   private session: LiveMusicSession;
-  private audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  private readonly sampleRate = 48000;
+  private audioContext = new (window.AudioContext || window.webkitAudioContext)(
+    {sampleRate: this.sampleRate},
+  );
   private outputNode: GainNode = this.audioContext.createGain();
   private nextStartTime = 0;
   private readonly bufferTime = 2; // adds an audio buffer in case of netowrk latency
-
-  @property({ type: Boolean }) private showMidi = false;
-  @state() private audioLevel = 0;
-  @state() private midiInputIds: string[] = [];
-  @state() private activeMidiInputId: string | null = null;
-
-  @property({ type: Object })
+  @state() private playbackState: PlaybackState = 'stopped';
+  @property({type: Object})
   private filteredPrompts = new Set<string>();
-
-  private audioLevelRafId: number | null = null;
   private connectionError = true;
 
   @query('play-pause-button') private playPauseButton!: PlayPauseButton;
   @query('toast-message') private toastMessage!: ToastMessage;
+  @query('settings-controller') private settingsController!: SettingsController;
 
-  constructor(
-    prompts: Map<string, Prompt>,
-    midiDispatcher: MidiDispatcher,
-  ) {
+  constructor(prompts: Map<string, Prompt>) {
     super();
     this.prompts = prompts;
-    this.midiDispatcher = midiDispatcher;
-    this.audioAnalyser = new AudioAnalyser(this.audioContext);
-    this.audioAnalyser.node.connect(this.audioContext.destination);
-    this.outputNode.connect(this.audioAnalyser.node);
-    this.updateAudioLevel = this.updateAudioLevel.bind(this);
-    this.updateAudioLevel();
+    this.nextPromptId = this.prompts.size;
+    this.outputNode.connect(this.audioContext.destination);
   }
 
   override async firstUpdated() {
     await this.connectToSession();
-    await this.setSessionPrompts();
+    this.setSessionPrompts();
   }
 
   private async connectToSession() {
@@ -1003,15 +1359,24 @@ class PromptDjMidi extends LitElement {
       model: model,
       callbacks: {
         onmessage: async (e: LiveMusicServerMessage) => {
+          console.log('Received message from the server: %s\n');
+          console.log(e);
           if (e.setupComplete) {
             this.connectionError = false;
           }
           if (e.filteredPrompt) {
-            this.filteredPrompts = new Set([...this.filteredPrompts, e.filteredPrompt.text])
+            this.filteredPrompts = new Set([
+              ...this.filteredPrompts,
+              e.filteredPrompt.text,
+            ]);
             this.toastMessage.show(e.filteredPrompt.filteredReason);
           }
           if (e.serverContent?.audioChunks !== undefined) {
-            if (this.playbackState === 'paused' || this.playbackState === 'stopped') return;
+            if (
+              this.playbackState === 'paused' ||
+              this.playbackState === 'stopped'
+            )
+              return;
             const audioBuffer = await decodeAudioData(
               decode(e.serverContent?.audioChunks[0].data),
               this.audioContext,
@@ -1022,13 +1387,15 @@ class PromptDjMidi extends LitElement {
             source.buffer = audioBuffer;
             source.connect(this.outputNode);
             if (this.nextStartTime === 0) {
-              this.nextStartTime = this.audioContext.currentTime + this.bufferTime;
+              this.nextStartTime =
+                this.audioContext.currentTime + this.bufferTime;
               setTimeout(() => {
                 this.playbackState = 'playing';
               }, this.bufferTime * 1000);
             }
 
             if (this.nextStartTime < this.audioContext.currentTime) {
+              console.log('under run');
               this.playbackState = 'loading';
               this.nextStartTime = 0;
               return;
@@ -1038,58 +1405,43 @@ class PromptDjMidi extends LitElement {
           }
         },
         onerror: (e: ErrorEvent) => {
+          console.log('Error occurred: %s\n', JSON.stringify(e));
           this.connectionError = true;
-          this.stop();
+          this.stopAudio();
           this.toastMessage.show('Connection error, please restart audio.');
-
         },
         onclose: (e: CloseEvent) => {
+          console.log('Connection closed.');
           this.connectionError = true;
-          this.stop();
+          this.stopAudio();
           this.toastMessage.show('Connection error, please restart audio.');
         },
       },
     });
   }
 
-  private getPromptsToSend() {
-    return Array.from(this.prompts.values())
-      .filter((p) => {
-        return !this.filteredPrompts.has(p.text) && p.weight !== 0;
-      })
-  }
-
   private setSessionPrompts = throttle(async () => {
-    const promptsToSend = this.getPromptsToSend();
-    if (promptsToSend.length === 0) {
-      this.toastMessage.show('There needs to be one active prompt to play.')
-      this.pause();
-      return;
-    }
+    const promptsToSend = Array.from(this.prompts.values()).filter((p) => {
+      return !this.filteredPrompts.has(p.text) && p.weight !== 0;
+    });
     try {
       await this.session.setWeightedPrompts({
         weightedPrompts: promptsToSend,
       });
     } catch (e) {
-      this.toastMessage.show(e.message)
-      this.pause();
+      this.toastMessage.show(e.message);
+      this.pauseAudio();
     }
   }, 200);
 
-  private updateAudioLevel() {
-    this.audioLevelRafId = requestAnimationFrame(this.updateAudioLevel);
-    this.audioLevel = this.audioAnalyser.getCurrentLevel();
-  }
-
   private dispatchPromptsChange() {
     this.dispatchEvent(
-      new CustomEvent('prompts-changed', { detail: this.prompts }),
+      new CustomEvent('prompts-changed', {detail: this.prompts}),
     );
-    return this.setSessionPrompts();
   }
 
   private handlePromptChanged(e: CustomEvent<Prompt>) {
-    const { promptId, text, weight, cc } = e.detail;
+    const {promptId, text, weight} = e.detail;
     const prompt = this.prompts.get(promptId);
 
     if (!prompt) {
@@ -1099,116 +1451,189 @@ class PromptDjMidi extends LitElement {
 
     prompt.text = text;
     prompt.weight = weight;
-    prompt.cc = cc;
 
     const newPrompts = new Map(this.prompts);
     newPrompts.set(promptId, prompt);
 
-    this.setPrompts(newPrompts);
-  }
-
-  private setPrompts(newPrompts: Map<string, Prompt>) {
     this.prompts = newPrompts;
+
+    this.setSessionPrompts();
+
     this.requestUpdate();
     this.dispatchPromptsChange();
   }
 
   /** Generates radial gradients for each prompt based on weight and color. */
-  private readonly makeBackground = throttle(
-    () => {
-      const clamp01 = (v: number) => Math.min(Math.max(v, 0), 1);
+  private makeBackground() {
+    const clamp01 = (v: number) => Math.min(Math.max(v, 0), 1);
 
-      const MAX_WEIGHT = 0.5;
-      const MAX_ALPHA = 0.6;
+    const MAX_WEIGHT = 0.5;
+    const MAX_ALPHA = 0.6;
 
-      const bg: string[] = [];
+    const bg: string[] = [];
 
-      [...this.prompts.values()].forEach((p, i) => {
-        const alphaPct = clamp01(p.weight / MAX_WEIGHT) * MAX_ALPHA;
-        const alpha = Math.round(alphaPct * 0xff)
-          .toString(16)
-          .padStart(2, '0');
+    [...this.prompts.values()].forEach((p, i) => {
+      const alphaPct = clamp01(p.weight / MAX_WEIGHT) * MAX_ALPHA;
+      const alpha = Math.round(alphaPct * 0xff)
+        .toString(16)
+        .padStart(2, '0');
 
-        const stop = p.weight / 2;
-        const x = (i % 4) / 3;
-        const y = Math.floor(i / 4) / 3;
-        const s = `radial-gradient(circle at ${x * 100}% ${y * 100}%, ${p.color}${alpha} 0px, ${p.color}00 ${stop * 100}%)`;
+      const stop = p.weight / 2;
+      const x = (i % 4) / 3;
+      const y = Math.floor(i / 4) / 3;
+      const s = `radial-gradient(circle at ${x * 100}% ${y * 100}%, ${p.color}${alpha} 0px, ${p.color}00 ${stop * 100}%)`;
 
-        bg.push(s);
-      });
+      bg.push(s);
+    });
 
-      return bg.join(', ');
-    },
-    30, // don't re-render more than once every XXms
-  );
-
-  private pause() {
-    this.session.pause();
-    this.playbackState = 'paused';
-    this.outputNode.gain.setValueAtTime(1, this.audioContext.currentTime);
-    this.outputNode.gain.linearRampToValueAtTime(0, this.audioContext.currentTime + 0.1);
-    this.nextStartTime = 0;
-    this.outputNode = this.audioContext.createGain();
-    this.outputNode.connect(this.audioContext.destination);
-    this.outputNode.connect(this.audioAnalyser.node);
-  }
-
-  private play() {
-
-    const promptsToSend = this.getPromptsToSend();
-    if (promptsToSend.length === 0) {
-      this.toastMessage.show('There needs to be one active prompt to play. Turn up a knob to resume playback.')
-      this.pause();
-      return;
-    }
-
-    this.audioContext.resume();
-    this.session.play();
-    this.playbackState = 'loading';
-    this.outputNode.gain.setValueAtTime(0, this.audioContext.currentTime);
-    this.outputNode.gain.linearRampToValueAtTime(1, this.audioContext.currentTime + 0.1);
-  }
-
-  private stop() {
-    this.session.stop();
-    this.playbackState = 'stopped';
-    this.outputNode.gain.setValueAtTime(0, this.audioContext.currentTime);
-    this.outputNode.gain.linearRampToValueAtTime(1, this.audioContext.currentTime + 0.1);
-    this.nextStartTime = 0;
+    return bg.join(', ');
   }
 
   private async handlePlayPause() {
     if (this.playbackState === 'playing') {
-      this.pause();
-    } else if (this.playbackState === 'paused' || this.playbackState === 'stopped') {
+      this.pauseAudio();
+    } else if (
+      this.playbackState === 'paused' ||
+      this.playbackState === 'stopped'
+    ) {
       if (this.connectionError) {
         await this.connectToSession();
         this.setSessionPrompts();
       }
-      this.play();
+      this.loadAudio();
     } else if (this.playbackState === 'loading') {
-      this.stop();
+      this.stopAudio();
     }
     console.debug('handlePlayPause');
   }
 
-  private async toggleShowMidi() {
-    this.showMidi = !this.showMidi;
-    if (!this.showMidi) return;
-    const inputIds = await this.midiDispatcher.getMidiAccess();
-    this.midiInputIds = inputIds;
-    this.activeMidiInputId = this.midiDispatcher.activeMidiInputId;
+  private pauseAudio() {
+    this.session.pause();
+    this.playbackState = 'paused';
+    this.outputNode.gain.setValueAtTime(1, this.audioContext.currentTime);
+    this.outputNode.gain.linearRampToValueAtTime(
+      0,
+      this.audioContext.currentTime + 0.1,
+    );
+    this.nextStartTime = 0;
+    this.outputNode = this.audioContext.createGain();
+    this.outputNode.connect(this.audioContext.destination);
   }
 
-  private handleMidiInputChange(event: Event) {
-    const selectElement = event.target as HTMLSelectElement;
-    const newMidiId = selectElement.value;
-    this.activeMidiInputId = newMidiId;
-    this.midiDispatcher.activeMidiInputId = newMidiId;
+  private loadAudio() {
+    this.audioContext.resume();
+    this.session.play();
+    this.playbackState = 'loading';
+    this.outputNode.gain.setValueAtTime(0, this.audioContext.currentTime);
+    this.outputNode.gain.linearRampToValueAtTime(
+      1,
+      this.audioContext.currentTime + 0.1,
+    );
   }
 
-  private resetAll() {
-    this.setPrompts(buildDefaultPrompts());
+  private stopAudio() {
+    this.session.stop();
+    this.playbackState = 'stopped';
+    this.outputNode.gain.setValueAtTime(0, this.audioContext.currentTime);
+    this.outputNode.gain.linearRampToValueAtTime(
+      1,
+      this.audioContext.currentTime + 0.1,
+    );
+    this.nextStartTime = 0;
+  }
+
+  private async handleAddPrompt() {
+    const newPromptId = `prompt-${this.nextPromptId++}`;
+    const usedColors = [...this.prompts.values()].map((p) => p.color);
+    const newPrompt: Prompt = {
+      promptId: newPromptId,
+      text: 'New Prompt', // Default text
+      weight: 0,
+      color: getUnusedRandomColor(usedColors),
+    };
+    const newPrompts = new Map(this.prompts);
+    newPrompts.set(newPromptId, newPrompt);
+    this.prompts = newPrompts;
+
+    await this.setSessionPrompts();
+
+    // Wait for the component to update and render the new prompt.
+    // Do not dispatch the prompt change event until the user has edited the prompt text.
+    await this.updateComplete;
+
+    // Find the newly added prompt controller element
+    const newPromptElement = this.renderRoot.querySelector<PromptController>(
+      `prompt-controller[promptId="${newPromptId}"]`,
+    );
+    if (newPromptElement) {
+      // Scroll the prompts container to the new prompt element
+      newPromptElement.scrollIntoView({
+        behavior: 'smooth',
+        block: 'nearest',
+        inline: 'end',
+      });
+
+      // Select the new prompt text
+      const textSpan =
+        newPromptElement.shadowRoot?.querySelector<HTMLSpanElement>('#text');
+      if (textSpan) {
+        textSpan.focus();
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(textSpan);
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+      }
+    }
+  }
+
+  private handlePromptRemoved(e: CustomEvent<string>) {
+    e.stopPropagation();
+    const promptIdToRemove = e.detail;
+    if (this.prompts.has(promptIdToRemove)) {
+      this.prompts.delete(promptIdToRemove);
+      const newPrompts = new Map(this.prompts);
+      this.prompts = newPrompts;
+      this.setSessionPrompts();
+      this.dispatchPromptsChange();
+    } else {
+      console.warn(
+        `Attempted to remove non-existent prompt ID: ${promptIdToRemove}`,
+      );
+    }
+  }
+
+  // Handle scrolling X-axis the prompts container.
+  private handlePromptsContainerWheel(e: WheelEvent) {
+    const container = e.currentTarget as HTMLElement;
+    if (e.deltaX !== 0) {
+      // Prevent the default browser action (like page back/forward)
+      e.preventDefault();
+      container.scrollLeft += e.deltaX;
+    }
+  }
+
+  private updateSettings = throttle(
+    async (e: CustomEvent<LiveMusicGenerationConfig>) => {
+      await this.session?.setMusicGenerationConfig({
+        musicGenerationConfig: e.detail,
+      });
+    },
+    200,
+  );
+
+  private async handleReset() {
+    if (this.connectionError) {
+      await this.connectToSession();
+      this.setSessionPrompts();
+    }
+    this.pauseAudio();
+    this.session.resetContext();
+    this.settingsController.resetToDefaults();
+    this.session?.setMusicGenerationConfig({
+      musicGenerationConfig: {},
+    });
+    setTimeout(this.loadAudio.bind(this), 100);
   }
 
   override render() {
@@ -1216,62 +1641,53 @@ class PromptDjMidi extends LitElement {
       backgroundImage: this.makeBackground(),
     });
     return html`<div id="background" style=${bg}></div>
-      <div id="buttons">
-        <button
-          @click=${this.toggleShowMidi}
-          class=${this.showMidi ? 'active' : ''}
-          >MIDI</button
-        >
-        <select
-          @change=${this.handleMidiInputChange}
-          .value=${this.activeMidiInputId || ''}
-          style=${this.showMidi ? '' : 'visibility: hidden'}>
-          ${this.midiInputIds.length > 0
-        ? this.midiInputIds.map(
-          (id) =>
-            html`<option value=${id}>
-                    ${this.midiDispatcher.getDeviceName(id)}
-                  </option>`,
-        )
-        : html`<option value="">No devices found</option>`}
-        </select>
+      <div class="prompts-area">
+        <div
+          id="prompts-container"
+          @prompt-removed=${this.handlePromptRemoved}
+          @wheel=${this.handlePromptsContainerWheel}>
+          ${this.renderPrompts()}
+        </div>
+        <div class="add-prompt-button-container">
+          <add-prompt-button @click=${this.handleAddPrompt}></add-prompt-button>
+        </div>
       </div>
-      <div id="grid">${this.renderPrompts()}</div>
-      <play-pause-button .playbackState=${this.playbackState} @click=${this.handlePlayPause}></play-pause-button>
+      <div id="settings-container">
+        <settings-controller
+          @settings-changed=${this.updateSettings}></settings-controller>
+      </div>
+      <div class="playback-container">
+        <play-pause-button
+          @click=${this.handlePlayPause}
+          .playbackState=${this.playbackState}></play-pause-button>
+        <reset-button @click=${this.handleReset}></reset-button>
+      </div>
       <toast-message></toast-message>`;
   }
 
   private renderPrompts() {
     return [...this.prompts.values()].map((prompt) => {
       return html`<prompt-controller
-        promptId=${prompt.promptId}
+        .promptId=${prompt.promptId}
         filtered=${this.filteredPrompts.has(prompt.text)}
-        cc=${prompt.cc}
-        text=${prompt.text}
-        weight=${prompt.weight}
-        color=${prompt.color}
-        .midiDispatcher=${this.midiDispatcher}
-        .showCC=${this.showMidi}
-        audioLevel=${this.audioLevel}
+        .text=${prompt.text}
+        .weight=${prompt.weight}
+        .color=${prompt.color}
         @prompt-changed=${this.handlePromptChanged}>
       </prompt-controller>`;
     });
   }
 }
 
-async function main(parent: HTMLElement) {
-  const midiDispatcher = new MidiDispatcher();
-  const initialPrompts = getInitialPrompts();
+function gen(parent: HTMLElement) {
+  const initialPrompts = getStoredPrompts();
 
-  const pdjMidi = new PromptDjMidi(
-    initialPrompts,
-    midiDispatcher,
-  );
-  parent.appendChild(pdjMidi);
+  const pdj = new PromptDj(initialPrompts);
+  parent.appendChild(pdj);
 }
 
-function getInitialPrompts(): Map<string, Prompt> {
-  const { localStorage } = window;
+function getStoredPrompts(): Map<string, Prompt> {
+  const {localStorage} = window;
   const storedPrompts = localStorage.getItem('prompts');
 
   if (storedPrompts) {
@@ -1284,50 +1700,57 @@ function getInitialPrompts(): Map<string, Prompt> {
     }
   }
 
-  console.log('No stored prompts, using default prompts');
+  console.log('No stored prompts, creating prompt presets');
 
-  return buildDefaultPrompts();
-}
-
-function buildDefaultPrompts() {
-  // Construct default prompts
-  // Pick 3 random prompts to start with weight 1
-  const startOn = [...DEFAULT_PROMPTS]
-    .sort(() => Math.random() - 0.5)
-    .slice(0, 3);
-
-  const prompts = new Map<string, Prompt>();
-
-  for (let i = 0; i < DEFAULT_PROMPTS.length; i++) {
-    const promptId = `prompt-${i}`;
-    const prompt = DEFAULT_PROMPTS[i];
-    const { text, color } = prompt;
-    prompts.set(promptId, {
-      promptId,
+  const numDefaultPrompts = Math.min(4, PROMPT_TEXT_PRESETS.length);
+  const shuffledPresetTexts = [...PROMPT_TEXT_PRESETS].sort(
+    () => Math.random() - 0.5,
+  );
+  const defaultPrompts: Prompt[] = [];
+  const usedColors: string[] = [];
+  for (let i = 0; i < numDefaultPrompts; i++) {
+    const text = shuffledPresetTexts[i];
+    const color = getUnusedRandomColor(usedColors);
+    usedColors.push(color);
+    defaultPrompts.push({
+      promptId: `prompt-${i}`,
       text,
-      weight: startOn.includes(prompt) ? 1 : 0,
-      cc: i,
+      weight: 0,
       color,
     });
   }
-
-  return prompts;
+  // Randomly select up to 2 prompts to set their weight to 1.
+  const promptsToActivate = [...defaultPrompts].sort(() => Math.random() - 0.5);
+  const numToActivate = Math.min(2, defaultPrompts.length);
+  for (let i = 0; i < numToActivate; i++) {
+    if (promptsToActivate[i]) {
+      promptsToActivate[i].weight = 1;
+    }
+  }
+  return new Map(defaultPrompts.map((p) => [p.promptId, p]));
 }
 
 function setStoredPrompts(prompts: Map<string, Prompt>) {
   const storedPrompts = JSON.stringify([...prompts.values()]);
-  const { localStorage } = window;
+  const {localStorage} = window;
   localStorage.setItem('prompts', storedPrompts);
+}
+
+function main(container: HTMLElement) {
+  gen(container);
 }
 
 main(document.body);
 
 declare global {
   interface HTMLElementTagNameMap {
-    'prompt-dj-midi': PromptDjMidi;
+    'prompt-dj': PromptDj;
     'prompt-controller': PromptController;
-    'weight-knob': WeightKnob;
+    'settings-controller': SettingsController;
+    'add-prompt-button': AddPromptButton;
     'play-pause-button': PlayPauseButton;
-    'toast-message': ToastMessage
+    'reset-button': ResetButton;
+    'weight-slider': WeightSlider;
+    'toast-message': ToastMessage;
   }
 }
