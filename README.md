@@ -28,7 +28,7 @@
 
 <p align="center">
 
-<img src="assets/screenshot.png" width="69%" alt="PromptDJ Screenshot" />
+> <img src="assets/screenshot.png" width="69%" height="width" alt="PromptDJ Screenshot" />
 
 
 </p>
